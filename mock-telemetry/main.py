@@ -82,7 +82,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             telemetry = generate_mock_telemetry()
             await websocket.send_json(telemetry)
-            await asyncio.sleep(random.uniform(6, 10))  # Random delay between 3 to 7 seconds
+            await asyncio.sleep(random.uniform(8, 13))  # Random delay between 8 to 13 seconds
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
