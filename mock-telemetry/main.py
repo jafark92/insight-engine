@@ -58,14 +58,14 @@ def generate_mock_telemetry():
         turbidity = random.uniform(0.1, 0.2)
 
     return {
-        "auv_id": f"AUV-{random.randint(1,5)}",
+        "auv_id": f"AUV-{random.randint(1,9)}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "location": {
             "lat": random.uniform(-9.0, -8.0),
             "lon": random.uniform(-147.0, -146.0)
         },
         "depth_m": random.uniform(4000, 4500),
-        "zone_id": f"ISA-ZONE-{random.randint(1,10)}",
+        "zone_id": f"ISA-ZONE-{random.randint(1,10)}", # It is a zone in which AUV should be
         "velocity_knots": random.uniform(1.5, 3.5),
         "temperature_c": temperature_c,
         "turbidity": turbidity
