@@ -8,14 +8,26 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 
+from app.config.settings import TELEMETRY_WS_URL
 from app.config.thresholds import ENVIRONMENTAL_THRESHOLDS
 from app.services.environmental_monitor import EnvironmentalMonitor
+from app.services.db import get_engine, get_sessionmaker
+from app.services.telemetry_ingest import ingest_telemetry
+from app.services.alerts_ingest import create_environmental_alert
+from app.services.zone_detector import detect_zone_violation
+from app.services.dead_auv_monitor import dead_auv_scanner
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize services
     """Start the telemetry monitoring when the application starts"""
-    asyncio.create_task(monitor_telemetry())
+    # Prepare DB engine/session factory
+    app.state.db_engine = get_engine()
+    app.state.db_sessionmaker = get_sessionmaker()
+    # Initialize background tasks (DB schema is managed by Alembic; no auto-create)
+    asyncio.create_task(monitor_telemetry(app))
+    # Dead AUV scanner
+    asyncio.create_task(broadcast_dead_auv(app))
     yield
     # Shutdown: Cleanup resources
     print("Shutting down Service...")
@@ -75,7 +87,7 @@ async def root():
 @app.websocket("/ws/alert")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for clients to receive environmental alerts
+    WebSocket endpoint for clients to receive Alerts
     """
     await manager.connect(websocket)
     try:
@@ -101,27 +113,68 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1011)  # Internal error
         await manager.disconnect(websocket)
 
-async def monitor_telemetry():
+async def monitor_telemetry(app: FastAPI):
     """
     Background task to monitor External telemetry Data and generate alerts
     """
     reconnect_delay = 5  # Reconnect delay
     
-    async def check_for_alert(telemetry: dict):
-        """Process telemetry data and check against environmental thresholds"""
+    async def process_telemetry(telemetry: dict):
+        """Ingest telemetry data and Process to check for alerts"""
+        # 1) Persist to DB using ORM session
+        tid = None # telemetry ID
+        try:
+            Session = app.state.db_sessionmaker
+            async with Session() as session:
+                async with session.begin():
+                    tid = await ingest_telemetry(session, telemetry)
+        except Exception as e:
+            print(f"DB insert error: {e}")
+
+        # 2) Environmental Thresholds alerts
         if alert := env_monitor.check_thresholds(telemetry):
+            # persist alert into DB
+            try:
+                Session = app.state.db_sessionmaker
+                async with Session() as session:
+                    async with session.begin():
+                        await create_environmental_alert(
+                            session,
+                            auv_id=telemetry.get("auv_id"),
+                            payload=alert,
+                            telemetry_id=tid,
+                        )
+            except Exception as e:
+                print(f"Env alert DB error: {e}")
+
+            # broadcast alert to clients
             await manager.broadcast({
-                "type": "alert",
+                "type": "environmental_alert",
                 "data": alert,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
-            print(f"Alert generated: {alert}")
+            print(f"Env alert: {alert}")
 
+        # 3) Zone detection (requires DB id)
+        try:
+            if tid is not None:
+                z = await detect_zone_violation(app.state.db_sessionmaker, tid)
+                if z:
+                    await manager.broadcast({
+                        "type": "zone_alert",
+                        "data": z,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                    print(f"Zone alert: {z}")
+        except Exception as e:
+            print(f"Zone detection error: {e}")
+
+    # Keep Listening to TELEMETRY WS URL
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(
-                    'ws://localhost:8001/ws/telemetry',
+                    TELEMETRY_WS_URL,
                     heartbeat=30,  # Enable heartbeat every 30 seconds
                     timeout=aiohttp.ClientTimeout(total=60)
                 ) as ws:
@@ -132,7 +185,7 @@ async def monitor_telemetry():
                             print(f"Received message: {msg.data}")
                             try:
                                 telemetry = json.loads(msg.data)
-                                await check_for_alert(telemetry)
+                                await process_telemetry(telemetry) # Process Telemetry Data for Alerts
                             except json.JSONDecodeError as e:
                                 print(f"Invalid JSON received: {e}")
                         elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -149,3 +202,15 @@ async def monitor_telemetry():
 
         print("Reconnecting to telemetry WebSocket...")
         await asyncio.sleep(reconnect_delay)
+
+
+async def broadcast_dead_auv(app: FastAPI):
+    """Background task to scan and broadcast dead AUV alerts."""
+    Session = app.state.db_sessionmaker
+    async for alert in dead_auv_scanner(Session):
+        await manager.broadcast({
+            "type": "dead_auv_alert",
+            "data": alert,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        print(f"Dead AUV alert: {alert}")
