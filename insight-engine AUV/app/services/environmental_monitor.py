@@ -1,11 +1,10 @@
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 class EnvironmentalMonitor:
     def __init__(self, thresholds: Dict):
         self.thresholds = thresholds
-        self.alerts_history: List[Dict] = []
-        
+
     def check_thresholds(self, telemetry: Dict) -> Optional[Dict]:
         """
         Check if telemetry data exceeds environmental thresholds
@@ -59,11 +58,6 @@ class EnvironmentalMonitor:
                 "auv_id": telemetry.get("auv_id"),
                 "alerts": alerts
             }
-            self.alerts_history.append(alert_record)
             return alert_record
             
         return None
-
-    def get_recent_alerts(self, limit: int = 10) -> List[Dict]:
-        """Get most recent alerts"""
-        return self.alerts_history[-limit:]
