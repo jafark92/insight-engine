@@ -4,7 +4,7 @@ import json
 from typing import List
 from datetime import datetime, timezone
 import aiohttp
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 
@@ -16,6 +16,7 @@ from app.services.telemetry_ingest import ingest_telemetry
 from app.services.alerts_ingest import create_environmental_alert
 from app.services.zone_detector import detect_zone_violation
 from app.services.dead_auv_monitor import dead_auv_scanner
+from app.services.insights import fetch_insights, InsightParams, ALERT_TYPES, SUMMARY_MODES_ALLOWED
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,9 +26,9 @@ async def lifespan(app: FastAPI):
     app.state.db_engine = get_engine()
     app.state.db_sessionmaker = get_sessionmaker()
     # Initialize background tasks (DB schema is managed by Alembic; no auto-create)
-    asyncio.create_task(monitor_telemetry(app))
+    # asyncio.create_task(monitor_telemetry(app))
     # Dead AUV scanner
-    asyncio.create_task(broadcast_dead_auv(app))
+    # asyncio.create_task(broadcast_dead_auv(app))
     yield
     # Shutdown: Cleanup resources
     print("Shutting down Service...")
@@ -83,6 +84,69 @@ async def root():
         content={"message": "Welcome to DeepSeaGuard Insight Engine"},
         status_code=200
     )
+
+@app.get("/insights", summary="Alerts feed & on-demand summaries", description="""
+Retrieve recent alerts with optional filtering and modular summaries.
+
+Examples:
+    - Recent alerts (default limit 20): /insights
+    - Alerts for one AUV: /insights?auv_id=AUV_1
+    - Only environmental alerts: /insights?type=environmental
+    - Timeseries (temperature/depth/etc.) for an AUV: /insights?auv_id=AUV_1&summary=true
+    - Explicit modes: /insights?auv_id=AUV_1&summary_modes=timeseries,stats
+    - Stats only (all AUVs): /insights?summary_modes=stats
+    - Longer window: /insights?auv_id=AUV_1&summary_modes=timeseries&window_minutes=120
+    - Limit timeseries points: /insights?auv_id=AUV_1&summary_modes=timeseries&timeseries_limit=100
+    - Select timeseries fields: /insights?auv_id=AUV_1&summary_modes=timeseries&timeseries_fields=temperature_c,depth_m,location
+    - Pagination with cursor: /insights?cursor=<next_cursor_from_previous>
+    - Since specific time: /insights?since=2025-08-12T10:00:00Z
+""")
+async def insights(
+        auv_id: str | None = Query(None, description="Filter alerts by AUV ID or AUV ID specific summaries"),
+        type: str | None = Query(None, description="Filter by alert type"),
+        limit: int = Query(20, ge=1, le=100, description="Max alerts to return (clamped to 100)"),
+        summary: bool = Query(False, description="Backward compatible: include default timeseries"),
+        summary_modes: str | None = Query(None, description="Comma-separated summary modes e.g. timeseries,stats"),
+        window_minutes: int = Query(20, ge=1, le=1440, description="Summary window size in minutes"),
+        timeseries_limit: int = Query(30, ge=10, le=200, description="Max telemetry points in timeseries"),
+        timeseries_fields: str | None = Query(None, description="Comma-separated subset of timeseries fields"),
+        since: str | None = Query(None, description="Return alerts with started_at > this ISO timestamp"),
+        cursor: str | None = Query(None, description="Pagination cursor from previous response.pagination.next_cursor"),
+):
+    # Validate type
+    if type and type not in ALERT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid type. Allowed: {sorted(ALERT_TYPES)}")
+    # Build params
+    summary_modes_list = None
+    if summary_modes:
+        summary_modes_list = [m.strip() for m in summary_modes.split(',') if m.strip()]
+        invalid = [m for m in summary_modes_list if m not in SUMMARY_MODES_ALLOWED]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid summary_modes {invalid}. Allowed: {sorted(SUMMARY_MODES_ALLOWED)}")
+    # Parse since ISO8601 if provided
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid since timestamp. Use ISO8601.")
+    ts_fields_list = None
+    if timeseries_fields:
+        ts_fields_list = [f.strip() for f in timeseries_fields.split(',') if f.strip()]
+    params = InsightParams(
+        auv_id=auv_id,
+        type=type,
+        limit=limit,
+        summary=summary,
+        summary_modes=summary_modes_list,
+        window_minutes=window_minutes,
+        timeseries_limit=timeseries_limit,
+        timeseries_fields=ts_fields_list,
+        since=since_dt,
+        cursor=cursor,
+    )
+    data = await fetch_insights(app.state.db_sessionmaker, params)
+    return JSONResponse(content=data, status_code=200)
 
 @app.websocket("/ws/alert")
 async def websocket_endpoint(websocket: WebSocket):
